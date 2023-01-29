@@ -1,0 +1,13 @@
+[package]
+name = "ppcasm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+compact_str = "0.6.1"
+object = { version = "0.29.0", features = ["write_std", "elf"], default-features = false }
+smallvec = { version = "1.10.0", features = ["const_generics", "const_new", "union"] }
+encoding_rs = "0.8.31"
+pratt = "0.4.0"
+ariadne = "0.1.5"
+unicode-ident = "1.0.5"
