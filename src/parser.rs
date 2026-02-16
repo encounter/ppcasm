@@ -1,13 +1,11 @@
 use core::mem::take;
 use std::{
-    error::Error,
     fmt::{Display, Formatter},
     iter::Peekable,
-    ops::Range,
     str::Chars,
 };
 
-use ariadne::{Color, ColorGenerator, Fmt};
+use ariadne::{ColorGenerator, Fmt};
 use compact_str::CompactString;
 use pratt::{Affix, Associativity, PrattParser, Precedence, Result as PrattResult};
 use smallvec::SmallVec;
@@ -109,12 +107,15 @@ enum ExpressionToken {
     Operand(Operand),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub(crate) enum RelocationKind {
     Absolute,
     Sda21,
     Ha,
+    H,
     L,
+    Rel24,
+    Rel14,
 }
 
 #[derive(Debug, PartialEq)]
@@ -168,6 +169,12 @@ macro_rules! str {
 impl<'a> Parser<'a> {
     pub(crate) fn new(s: &'a str) -> Parser<'a> {
         Self { inner: s.chars().peekable(), peek_char: None, position: 0 }
+    }
+
+    /// Returns true if there are no more statements to parse.
+    pub(crate) fn at_end(&mut self) -> bool {
+        self.skip_newlines();
+        self.peek().is_none()
     }
 
     fn next(&mut self) -> Option<char> {
@@ -278,7 +285,7 @@ impl<'a> Parser<'a> {
 
     fn symbol(&mut self) -> ParseResult<Symbol> {
         self.skip();
-        let mut source = self.begin_source();
+        let source = self.begin_source();
         let c = self.next().ok_or_else(|| {
             let mut colors = ColorGenerator::new();
             let a = colors.next();
@@ -327,8 +334,42 @@ impl<'a> Parser<'a> {
                                 self.advance();
                                 result.push('"');
                             }
-                            Some('0') => todo!("octal"),
-                            Some('x') => todo!("hex"),
+                            Some(c @ '0'..='7') => {
+                                self.advance();
+                                let mut val = c as u32 - '0' as u32;
+                                for _ in 0..2 {
+                                    match self.peek() {
+                                        Some(d @ '0'..='7') => {
+                                            self.advance();
+                                            val = val * 8 + (d as u32 - '0' as u32);
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                result.push(char::from(val as u8));
+                            }
+                            Some('x') => {
+                                self.advance();
+                                let mut val = 0u32;
+                                for _ in 0..2 {
+                                    match self.peek() {
+                                        Some(d @ '0'..='9') => {
+                                            self.advance();
+                                            val = val * 16 + (d as u32 - '0' as u32);
+                                        }
+                                        Some(d @ 'a'..='f') => {
+                                            self.advance();
+                                            val = val * 16 + (d as u32 - 'a' as u32 + 10);
+                                        }
+                                        Some(d @ 'A'..='F') => {
+                                            self.advance();
+                                            val = val * 16 + (d as u32 - 'A' as u32 + 10);
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                result.push(char::from(val as u8));
+                            }
                             Some(c) => {
                                 let mut colors = ColorGenerator::new();
                                 let a = colors.next();
@@ -422,6 +463,17 @@ impl<'a> Parser<'a> {
         self.skip_newlines();
         let mut source = self.begin_source();
         let mut symbol = self.symbol()?;
+        // Absorb branch prediction hints (+/-) that follow the mnemonic
+        // e.g. "beq+" or "bne-"
+        match self.peek() {
+            Some(c @ '+') | Some(c @ '-') => {
+                if let Symbol::Regular(ref mut s) = symbol {
+                    s.push(c);
+                    self.advance();
+                }
+            }
+            _ => {}
+        }
         self.end_source(&mut source);
         self.skip();
         match self.peek() {
@@ -484,6 +536,7 @@ impl<'a> Parser<'a> {
                 let kind = match symbol.string().to_ascii_lowercase().as_str() {
                     "sda21" => RelocationKind::Sda21,
                     "ha" => RelocationKind::Ha,
+                    "h" => RelocationKind::H,
                     "l" => RelocationKind::L,
                     _ => {
                         let mut colors = ColorGenerator::new();
@@ -514,7 +567,7 @@ impl<'a> Parser<'a> {
         };
         Ok(match self.peek() {
             Some('(') => {
-                let mut source = self.begin_source();
+                let source = self.begin_source();
                 self.advance();
                 let offset_expr = self.expression()?;
                 match self.peek() {
@@ -589,7 +642,7 @@ impl<'a> Parser<'a> {
         let mut source = self.begin_source();
         match self.peek() {
             Some('(') => {
-                let mut source = self.begin_source();
+                let source = self.begin_source();
                 self.advance();
                 let expr = self.expression()?;
                 self.skip();
@@ -709,6 +762,12 @@ impl<'a> Parser<'a> {
                 } else {
                     if let Ok(v) = i64::from_str_radix(result.as_str(), radix) {
                         return Ok(Operand::Number(v, source));
+                    }
+                    // If i64 overflows for a decimal number, try f64
+                    if radix == 10 {
+                        if let Ok(v) = result.parse::<f64>() {
+                            return Ok(Operand::Double(v, source));
+                        }
                     }
                 }
                 return Ok(Operand::Symbol(Symbol::Regular(result), source));
